@@ -1,0 +1,536 @@
+---
+title: "Bellabeat Case Study"
+author: "Ash Summers"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Introduction
+
+Bellabeat is a small company that makes health-focused smart products for women. Sršen, cofounder and Chief Creative Officer of Bellabeat, has asked to have smart device fitness data analyzed to give insight into how customers use smart devices. She wants to see how these insights will apply to the Bellabeat products and guide their marketing strategy. Therefore, we want to know what kind of people use fitness apps and what their habits look like. We can look at what fitness habits users track such as steps, sleep, and weight. So, we also want to look at their tracking habits such as frequency. Finally, we want to get a picture of the demographic that are tracking their habits such as their general health profiles. From this, we can provide Sršen a picture of what kind of people her products should be marketed towards.
+
+Products:
+
+* Bellabeat app: Helps users track activity, sleep, stress, water intake, menstrual cycle, and mindfulness habits.
+* Leaf, Time: Trackers that connect to app to track activity, sleep, and stress.
+* Spring: Water bottle that tracks water intake.
+* Bellabeat membership: Gives users personalized health guidance.
+
+
+
+# Data Cleaning
+
+In order to approach this problem, [FitBit Fitness Tracker Data](https://www.kaggle.com/arashnic/fitbit) will be analyzed. The data contains the personal tracker data of 30 FitBit users and includes daily activity (calories, intensities, and steps), heart rate, METs, sleep, and weight. The data comes from a public dataset on Kaggle and a detailed description of the datasets and their variables can be found [on fitabase](https://www.fitabase.com/media/1930/fitabasedatadictionary102320.pdf).
+
+### Data Import
+
+In order to set up the environment, the required packages need to be loaded.
+
+```{r results=FALSE, message=FALSE, warning=FALSE}
+library("tidyverse")
+library("data.table")
+library("lubridate")
+library("knitr")
+library("ggcorrplot")
+```
+
+Instead of reading in each file separately (18 total), they were read and stored in a large list using lapply which applies fread to each file and then saves each as an element in a list. Each dataframe in the large list were named using 'gsub()' which cuts off the end of the file name (“_merged.csv”).
+
+```{r}
+file_list <- list.files(path = "C:/Users/espir/Dropbox/RStudio/Google_Cert/Fitbit_Fitness_Tracker_Data", full.names = TRUE)
+datasets <- lapply(file_list, fread)
+names(datasets) <- gsub('.{11}$', '', basename(file_list))
+```
+
+
+### Looking at the Data
+
+Viewing the data in the environment shows that there is data for steps, intensities (by distance in Km and minutes), calories (energy expenditure), sleep, weight (including fat and BMI), METs, and heart rate. There is data for daily, hourly, per minute, and per second. The daily activity is also broken up into datasets that just show the calories, intensities, and steps. A data frame was made to briefly explore a summary of the data. Sapply was used here in order to apply each function to each dataset.
+
+```{r}
+summary <- data.frame(
+    sapply(datasets, nrow), #applies nrow to each df in datasets
+    sapply(datasets, ncol),
+    sapply(datasets, FUN = function(x) {sum(is.na(x))}),
+    sapply(datasets, FUN = function(x) {n_distinct(x[[1]])}),
+    sapply(datasets, FUN = function(x) {sum(duplicated(x))})
+    )
+names(summary) <- c("Rows", "Cols", "NA", "Distinct", "Duplicated")
+kable(summary, caption = "Summary of FitBit Tracker Data")
+```
+
+The summary showed that there are several row and column sizes. The only dataset with NAs is “weightLogInfo”. Most of the datasets have 33 distinct IDs with “heartrate_seconds” having 14, “minuteSleep” and “sleepDay” having 24, and “weightLogInfo” having 8 distinct IDs. A Kaggle, the discussion mentions that there being 33 IDs, despite there only being 30 users, is likely due to a few users having multiple FitBits. Finally, two datasets have duplicated data - “minuteSleep” and “sleepDay”. For the “weightLogInfo” dataset, the columns were checked to see where the NAs were located. The NAs were only in the “Fat” column. Since 65 out of 67 rows in the column have NAs, this column will be dropped.
+
+```{r}
+kable(sapply(datasets$weightLogInfo, FUN = function(x) {sum(is.na(x))}),
+      col.names = c("NAs"), caption = "Count of NAs in Weight Data")
+```
+
+
+### Daily Data
+
+The daily datasets were cleaned up - removing time from and renaming date column, dropping unnecessary columns, removing duplicate entries, and creating a new column, called “TotalMinutesNotAsleep”, which represents the time restless or awake while in bed.
+
+```{r warning=FALSE}
+datasets$dailyActivity <- datasets$dailyActivity %>%
+    rename(Date = ActivityDate) %>%
+    select(-c(LoggedActivitiesDistance, TrackerDistance))
+
+datasets$sleepDay <- datasets$sleepDay %>%
+    separate(SleepDay, c("Date", "Time"), sep = " ") %>%
+    mutate(TotalMinutesNotAsleep = TotalTimeInBed - TotalMinutesAsleep) %>%
+    select(-c(TotalSleepRecords, TotalTimeInBed, Time)) %>%
+    distinct() 
+
+datasets$weightLogInfo <- datasets$weightLogInfo %>%
+    separate(Date, c("Date", "Time"), sep = " ") %>%
+    select(-c(WeightKg, Fat, IsManualReport, LogId, Time))
+```
+
+The daily datasets were then combined via an outer join using the Id and Date as the keys.
+
+```{r}
+daily <- merge(datasets$dailyActivity, datasets$sleepDay, 
+               by = c("Id","Date"), all = TRUE)
+daily <- merge(daily, datasets$weightLogInfo, 
+               by = c("Id","Date"), all = TRUE)
+```
+
+Part of the analysis will be to compare the data over the day of the week, so a new column was added for the weekday. The total distance was changed from km to miles. The other distances will be put into a different table and not used directly from this table, so they were ignored for now. The columns were also changed to the correct class.
+
+```{r}
+daily$Date <- mdy(daily$Date)
+daily <- mutate(daily,
+                Weekday = wday(daily$Date, label = TRUE, abbr = FALSE,
+                          week_start = getOption("lubridate.week.start", 1)),
+                .after = Date,
+                TotalDistance = 0.621371*TotalDistance)
+daily <- mutate_if(daily, is.integer, as.numeric)
+daily$Id <- as.character(daily$Id)
+kable(head(daily, n = 10L), caption = "Combined Daily Data")
+```
+
+
+### Long Data
+
+In order to effectively to make visualizations, the data needs to be transformed into long format. First, a table in long format was made for the intensities and sleep. For sleep, the columns needed were taken from the daily table. Then, 'complete.cases' was used to remove the rows that didn’t have data and the columns were renamed before transforming the table.
+
+```{r}
+sleep_long <- daily[ , c(1:3, 15:16)]
+sleep_long <- sleep_long[complete.cases(sleep_long), ] %>%
+    rename(Asleep = TotalMinutesAsleep, NotAsleep = TotalMinutesNotAsleep) %>%
+    melt(id.vars = c("Id", "Date", "Weekday"),
+         variable.name = "ActivityType",
+         value.name = "Minutes")
+kable(head(sleep_long), caption = "Long Sleep Data")
+```
+
+The intensity data was a bit more complicated. There was intensity data for both distance and minutes. So, the distance and minutes first had to be transformed to wide format separately and then joined.
+
+```{r}
+distances <- daily[ , c(1:3, 6:9)] %>%
+    rename(VeryActive = VeryActiveDistance,
+           ModeratelyActive = ModeratelyActiveDistance,
+           LightlyActive = LightActiveDistance,
+           Sedentary = SedentaryActiveDistance) %>%
+    melt(id.vars = c("Id", "Date", "Weekday"),
+         variable.name = "ActivityType",
+         value.name = "Distance")
+
+minutes <- daily[ , c(1:3, 10:13)] %>%
+    rename(VeryActive = VeryActiveMinutes,
+           ModeratelyActive = FairlyActiveMinutes,
+           LightlyActive = LightlyActiveMinutes,
+           Sedentary = SedentaryMinutes) %>%
+    melt(id.vars = c("Id", "Date", "Weekday"),
+         variable.name = "ActivityType",
+         value.name = "Minutes")
+
+intensity_long <- merge(distances, minutes,
+                        by = c("Id", "Date", "Weekday" ,"ActivityType"))
+intensity_long <- mutate(intensity_long, Distance = 0.621371*Distance)
+
+kable(head(intensity_long), caption = "Long Intensity Data")
+```
+
+In order to also look at the time spent throughout the day, the sleep and intensity per minute data was combined. The variable names for the activity types had previously labeled the same, so the data was easily merged by all of the columns in 'sleep_long'.
+
+```{r}
+activity_long <- merge(sleep_long, intensity_long[ , c(1:4, 6)], 
+                       by = colnames(sleep_long), all = TRUE)
+kable(head(activity_long, n = 8L), caption = "Long Activity Data")
+```
+
+Finally, the data not in the sleep or intensity tables was put into a final table and transformed into long format. There were a lot of NAs from merging all the data into the daily table which left many rows without values, so 'complete.cases' was used to remove those rows.
+
+```{r}
+daily_long <- melt(daily[ , c(1:5, 14, 17:18)],
+    id.vars = c("Id", "Date", "Weekday"))
+daily_long <- daily_long[complete.cases(daily_long), ]
+kable(head(daily_long), caption = "Long Daily Data")
+```
+
+
+
+# Analysis
+
+### Exploring the Data
+
+The first step of the analysis was to take a look at some statistics on the data. This was done by grouping the data by the variable being analyzed and then using 'summarise' to take the mean, median, min, and max of each variable. Two tables were made so that it was clear which intensity value was being shown (distance or minutes).
+
+```{r}
+daily_stats <- daily_long %>%
+    group_by(variable) %>%
+    rename(ActivityType = variable) %>%
+    summarise(Mean = round(mean(value), 1), #rounds to 1 digit after decimal
+              Median = round(median(value), 1),
+              Min = round(min(value), 1),
+              Max = round(max(value), 1))
+activity_stats <- activity_long %>%
+    group_by(ActivityType) %>%
+    summarise(Mean = round(mean(Minutes), 1),
+              Median = round(median(Minutes), 1),
+              Min = round(min(Minutes), 1),
+              Max = round(max(Minutes), 1))
+daily_stats <- rbind(daily_stats, activity_stats)
+distance_stats <- intensity_long %>%
+    group_by(ActivityType) %>%
+    summarise(Mean = round(mean(Distance), 1),
+              Median = round(median(Distance), 1),
+              Min = round(min(Distance), 1),
+              Max = round(max(Distance), 1))
+kable(daily_stats, caption = "Daily Tracking Statistics")
+kable(distance_stats, caption = "Intensity By Distance")
+```
+
+At first glance, there seems to be a problem with the data. There are several variables where the minimum value is 0. Most of these variables shouldn’t have any 0 values since the FitBit only records if there is activity. Similarly, it records total calorie expenditure which includes [BMR (Basal Metabolic Rate)](https://www.healthline.com/health/what-is-basal-metabolic-rate). So, this value can’t be 0. Therefore, it is likely that there are errors in the data that’s creating 0s where there should be NAs. Looking directly at the data, there are several calorie values that are either 0 or very low, so it seems like there are cases where the calorie expenditure wasn’t collected correctly.
+
+For most of the variables, the mean and median values are about the same which means that the data for those variables isn’t skewed. This is interesting because, despite this, several variables have high maximum values compared to the mean. However, there are a few variables that are clearly skewed. For the very active and moderately active intensities, both the minute and distance means are significantly higher than the medians. So, there are likely a few very active people that are skewing the average. This gives a few ideas of what aspects of the data needs to be explored. Graphs were made to look at daily activity and sleep over time.
+
+```{r}
+ggplot(daily_long, aes(x = Date, y = Id)) +
+    geom_point(aes(col = variable, size = value)) +
+    labs(title = "Activity Over Time", x = "Date", y = "ID")
+ggplot(sleep_long, aes(x = Date, y = Id)) +
+    geom_point(aes(col = ActivityType, size = Minutes)) +
+    labs(title = "Sleep Over Time", x = "Date", y = "ID")
+```
+
+The first shows that most of the users were tracking their step habits on a daily basis. Those that didn’t stopped altogether. The second shows a different picture. It only shows the users that tracked their sleep, but those that did vary on the frequency in which they tracked. This graph also shows that some users spend a lot of time in bed, but not sleeping as well as some users sleeping very little. This says that either there is likely errors in the sleep tracking and that perhaps some only tracked when they took naps. The first graph was split by the variable to get a better look at what habits were being tracked.
+
+```{r}
+ggplot(daily_long, aes(x = Date, y = Id)) +
+    geom_point(colour = "aquamarine4") +
+    facet_wrap(~variable) + #creates a new graph for each variable
+    labs(title = "Activity Over Time Per Variable", x = "Date", y = "Users") + 
+    guides(y = "none")
+```
+
+This graph shows that only two people regularly tracked their weight and BMI. Six other people recorded their weight and BMI over the course of the month. Overall, this shows that most people tracked their total steps, total distance, and calories over the course of the month, but most didn’t track their weight and BMI. Comparing the graphs for weight and sleep shows that the weight trackers didn’t all track their sleep. The intensity data was further explored here using two different graphs.
+
+```{r message=FALSE}
+ggplot(intensity_long, aes(x = Date, y = Distance)) + 
+  geom_point(aes(col = ActivityType, size = Minutes)) + 
+  labs(title = "Activity Over Time",
+       x = "Date", y = "Distance (km)", col = "Intensity")
+ggplot(intensity_long, aes(x = Minutes, y = Distance)) +
+    geom_point(aes(col = ActivityType)) + 
+    geom_smooth(method = "loess", se = FALSE) + #adds line without confidence interval
+    labs(title = "Minutes Vs Distance",
+         x = "Minutes", y = "Distance (Km)", col = "Intensity")
+```
+
+These graphs show that there are definitely outliers for the very active intensity. The first shows that the activity levels seem to vary somewhat from day to day, but not a large amount. This will be explored later to see how the data varies based on the day of the week. The graphs also show that there seems to be a correlation between the distance and time of each activity level. To further explore what correlations might be in the data, a correlogram was made.
+
+```{r}
+daily_corr <- round(cor(daily[ , 4:18], use = "na.or.complete"), 1)
+ggcorrplot(daily_corr, hc.order = TRUE, #organizes variables by corrs 
+           method = "circle", type = "upper", #puts corrs on top half
+           title = "Correlations of Daily Tracker Data",
+           lab = TRUE, lab_size = 4)
+```
+
+This graph shows that there are strong positive correlations between distance and time of each activity level. There are also strong positive correlations between steps and distance (which intuitively makes sense) as well as steps and time. However, one relationship that stands out is a strong negative correlation between total minutes asleep and sedentary minutes. A graph was made to better illustrate this relationship.
+
+```{r warning=FALSE, message=FALSE}
+ggplot(daily, aes(SedentaryMinutes, TotalMinutesAsleep)) +
+    geom_jitter(colour = "aquamarine4") +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(title="Sedentary Minutes Vs Minutes Asleep", 
+       x = "Sedentary Minutes", y = "Minutes Asleep")
+```
+
+
+### Health Data
+
+Before looking into the FitBit data further, it was necessary to first take a look at current health data in order to have a basis for comparison. The recommended steps per day can be found on [Medical News Today](https://www.medicalnewstoday.com/articles/how-many-steps-should-you-take-a-day#for-general-health):
+
+> Walking is a form of low impact, moderate intensity exercise that has a range of health benefits and few risks. As a result, the CDC recommend that most adults aim for 10,000 steps per day. For most people, this is the equivalent of about 8 kilometers, or 5 miles. Most people in the United States only take 3,000–4,000 steps per day, which equates to about 1.5–2 miles. As doctors generally consider fewer than 5,000 steps per day to be sedentary, this means that many people in the U.S. are not getting as many steps as they should to benefit their health.
+
+The calorie data is what FitBit calculated to be the users calorie expenditure. This calculation is detailed [on fitabase](https://www.fitabase.com/media/1930/fitabasedatadictionary102320.pdf):
+
+> Fitbit uses the gender, age, height, and weight data entered into the user profile to
+calculate basal metabolic rate (BMR). The estimated energy expenditure that Fitbit provides
+takes into account the user’s BMR, the activity recorded by the device, and any manually logged
+activities.
+
+The data provided only provides the calorie data and not the users profile or their BMI. But, a general range for average calorie expenditure can be found for each gender on [Healthline](https://www.healthline.com/health/fitness-exercise/how-many-calories-do-i-burn-a-day):
+
+> Most female adults need 1,600–2,200 calories per day, while adult males need 2,200–3,000 calories per day. However, the amount of calories you need each day is unique to your body and activity levels. If you’re looking to maintain your weight, you’ll want to ensure your calorie intake matches your calorie expenditure. 
+
+In order to determine the ideal weight for each gender, the average heights of each is needed. Looking at [World Data](https://www.worlddata.info/average-bodyheight.php), the average height for each country for women is 1.51m to 1.70m and for men is 1.59m to 1.84m. Converting to imperial measurements, the average height for women is 59.4in. to 66.9in. (4’11” - 5’9”) and for men is 62.6in. to 72.4in. (5’3” - 6’). According to [Medical News Today](https://www.medicalnewstoday.com/articles/323446):
+
+> BMI is a common tool that measures a person’s weight in relation to their height. A BMI calculation provides a single number, which falls into the following categoriesTrusted Source:
+>
+> * A BMI of less than 18.5 means a person is underweight.
+> * A BMI of between 18.5 and 24.9 is ideal.
+> * A BMI of between 25 and 29.9 is overweight.
+> * A BMI over 30 indicates obesity.
+
+Medical News Today also provided charts for the ideal weight based on the ideal BMI and the average height. Using the average height range, the ideal weight for women is 94lbs to 153lbs and for men is 107lbs to 177lbs. Finally, [Sleep Foundation]() provides current research on the ideal amount of sleep needed:
+
+> National Sleep Foundation guidelines advise that healthy adults need between 7 and 9 hours of sleep per night. Babies, young children, and teens need even more sleep to enable their growth and development. People over 65 should also get 7 to 8 hours per night.
+
+```{r echo=FALSE}
+health_data <- matrix(c("Steps", "Low: 5k", "Recommended: 10k", "", "",
+    "Calories", "Women: 1,600-2,200", "Men: 2,200-3,000", "", "",
+    "Weight", "Women: 94lbs-153lbs", "Men: 107lbs-177lbs", "", "",
+    "BMI", "Underweight: < 18.5", "Ideal: 18.5-25", "Overweight: 25-30",
+    "Obese: > 30", "Sleep", "7-9 hours", "", "", ""),
+    nrow = 5, ncol = 5, byrow = FALSE)
+kable(health_data, caption = "Summary of Health Data")
+```
+
+
+### Averages By ID
+
+The next step of the analysis was to look at the daily tracking averages for each user. To do this, the data was grouped by Id, and activity type for the sleep and intensity data, and then to take the mean of each variable.
+
+```{r message=FALSE}
+daily_id_means <- daily %>%
+    group_by(Id) %>%
+    summarise(Steps = round(mean(TotalSteps, na.rm = TRUE)),
+              Distance = round(mean(TotalDistance, na.rm = TRUE), 1),
+              Calories = round(mean(Calories, na.rm = TRUE)),
+              Weight = round(mean(WeightPounds, na.rm = TRUE), 1),
+              BMI = round(mean(BMI, na.rm = TRUE), 1))
+sleep_id_means <- sleep_long %>%
+    group_by(Id, ActivityType) %>%
+    summarise(Hours = round(mean(Minutes)/60, 1))
+intensity_id_means <- intensity_long %>%
+    group_by(Id, ActivityType) %>%
+    summarise(Distance = round(mean(Distance), 1),
+              Hours = round(mean(Minutes)/60, 1))
+activity_id_means <- activity_long %>%
+    group_by(Id, ActivityType) %>%
+    summarise(Hours = round(mean(Minutes)/60, 1))
+kable(head(daily_id_means), caption = "Daily Activity Averages By ID")
+kable(head(sleep_id_means, n = 4L), caption = "Sleep Averages By ID")
+kable(head(intensity_id_means), caption = "Intensity Averages By ID")
+kable(head(activity_id_means), caption = "Activity Averages By Id")
+```
+
+All of the variables were then plotted in separate bar graphs. See code for notes on how the graphs were made.
+
+```{r}
+ggplot(daily_id_means) +
+    geom_bar(stat = "identity", #allows mapping of y values
+        aes(x = Id, y = Steps), fill = "aquamarine4") +
+    geom_hline(aes(yintercept = 5000, col = "Low")) +
+    geom_hline(aes(yintercept = 10000, col = "Ideal")) +
+    #draws horizontal lines with labels
+    labs(title = "Step Habits per Id", x = "Users", col = "Steps") +
+    guides(x = "none") #removes messy Id labels on x-axis
+```
+
+This graph shows that FitBit users varied a lot in their step habits. Despite that the average user tracked their steps daily, most users fell below the ideal step count. Most still had a step count above the low bar. However, there was still several people that had low/sedentary level activity. It is possible that the users with low step counts don’t track their steps throughout the day.
+
+```{r}
+ggplot(daily_id_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = Calories), fill = "aquamarine4") +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 1600, ymax = 2200,
+                  col = "Women"), fill = "lightblue", alpha = 0.03) +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 2200, ymax = 3000,
+                  col = "Men"), fill = "pink", alpha = 0.03) +
+    #draws rectangles with color and labels
+    labs(title = "Calories per Id", x = "Users", col = "Average Calories") +
+    guides(x = "none")
+```
+
+Overall, there are a few users with both low and high calorie energy expenditures. Comparing this graph to the previous one, it doesn’t seem that the calorie expenditures match the step count. This matches the correlation data as the correlation between steps and calories was 0.5 which is only a moderate correlation (rather than strong). Those with high energy expenditures are likely doing additional activities such as playing sports. Unfortunately, the FitBit data didn’t include user profile information such as gender. Looking at this graph, it is likely that the users that fall within the average range for women are women and similarly for men, but there is no way to know. So, this is a large limitation of this data because men and women have very different averages which means gender information is needed to further analyze the calorie expenditure data for health insights.
+
+```{r}
+ggplot(daily_id_means[complete.cases(daily_id_means), ]) +
+    #Using complete.cases to remove those that didn't track their weight
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = Weight), fill = "aquamarine4") +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 94, ymax = 153,
+                  col = "Women"), fill = "lightblue", alpha = 0.03) +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 107, ymax = 177,
+                  col = "Men"), fill = "pink", alpha = 0.03) +
+    labs(title = "Weight per Id", x = "Users", col = "Ideal Weight") +
+    guides(x = "none")
+```
+
+Again, without gender information, it’s hard to get many insights on weight information. However, most users are within both the male and female ideal weight. Two users are slightly above the male ideal weight and one is very obviously overweight. This says that most users are likely either a healthy weight or only slightly overweight.
+
+```{r}
+ggplot(daily_id_means[complete.cases(daily_id_means), ]) +
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = BMI), fill = "aquamarine4") +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 0, ymax = 18,
+                  col = "Underweight"), fill = "purple", alpha = 0.01) +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 18.5, ymax = 24.5,
+                  col = "Ideal"), fill = "pink", alpha = 0.03) +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 25, ymax = 29.5,
+                  col = "Overweight"), fill = "lightblue", alpha = 0.03) +
+    geom_rect(aes(xmin = 0, xmax = length(Id) +1, ymin = 30, ymax = 50,
+                  col = "Obese"), fill = "lightgreen", alpha = 0.03) +
+    labs(title = "BMI per Id", x = "Users", col = "BMI") +
+    guides(x = "none")
+```
+
+Unlike weight, BMI recommendations doesn’t require gender. So, this gives a better picture of the users health. According to their BMI, all but one user is either ideal or overweight.
+
+```{r}
+ggplot(sleep_id_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = Hours, fill = ActivityType),
+             position = position_stack(reverse = TRUE)) +
+    geom_rect(aes(xmin = 0, xmax = length(Id)/2+1, ymin = 7, ymax = 9,
+                  col = "Recommended"), fill = "pink", alpha = 0.02) +
+    labs(title = "Sleep Habits per Id", x = "Users", col = "Sleep") +
+    guides(x = "none")
+```
+
+According to the graph, most people fall inside or near the recommended range of sleep. However, interesting part about the data is that there are a few people that seem to spend less than 5 hours sleeping and one person that spends a lot of time in bed. This says that there are likely errors in the sleep tracking data collection.
+
+```{r}
+ggplot(intensity_id_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = Distance, fill = ActivityType)) +
+    labs(title = "Intensity Distance per Id", x = "Users") +
+    guides(x = "none")
+```
+
+Based on this graph, nearly all users participated in some moderately or very active exercise. Most also had a large portion of moderately or very active exercise.
+
+```{r}
+ggplot(activity_id_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = Hours, fill = ActivityType)) +
+    labs(title = "Activity per Id", x = "Users") +
+    guides(x = "none")
+```
+
+This graph was intended to show different activity levels. However, it seems that the sedentary data and sleep data likely overlap; afterall, several users are showing more than 24 hours of activity. This seems to further show that the sleep data isn’t accurate. Because this graph was not an accurate depiction of activity, a graph was made of just the intensity data.
+
+```{r}
+ggplot(intensity_id_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Id, y = Hours, fill = ActivityType)) +
+    labs(title = "Intensity Time per Id", x = "Users") +
+    guides(x = "none")
+```
+
+Based on this graph, everyone spends at least 10 hours a day being sedentary. Aside from sedentary time, the users all spent most of their time being lightly active. Even the users that had the highest distance in the moderately active and very active types only spent a small time doing this more intense activity.
+
+
+### Averages By Day Of Week
+
+The next step of the analysis was to look at the daily tracking averages for each day of the week to see if there’s any trends in tracking. Distance and calories are based on step count tracking and BMI is based on weight tracking, so these variables will be ignored for this part of the analysis.
+
+```{r message=FALSE}
+daily_wday_means <- daily %>%
+    group_by(Weekday) %>%
+    summarise(Steps = round(mean(TotalSteps, na.rm = TRUE)),
+              HoursAsleep = round(mean(TotalMinutesAsleep, na.rm = TRUE)/60, 1),
+              HoursNotAsleep = round(mean(TotalMinutesNotAsleep,
+                                          na.rm = TRUE)/60, 1),
+              Weight = round(mean(WeightPounds, na.rm = TRUE), 1))
+sleep_wday_means <- sleep_long %>%
+    group_by(Weekday, ActivityType) %>%
+    summarise(Hours = round(mean(Minutes)/60, 1))
+intensity_wday_means <- intensity_long %>%
+    group_by(Weekday, ActivityType) %>%
+    summarise(Distance = round(mean(Distance), 1), 
+              Hours = round(mean(Minutes)/60, 1))
+kable(daily_wday_means, caption = "Daily Averages per Day Of Week")
+kable(head(intensity_wday_means), 
+      caption = "Intensity Averages per Day of Week")
+```
+
+The steps and weight seem to be about the same over each day of the week with the exception of a high weight on Tuesday which is likely due to the obese person tracking their weight on that day. Graphs were made of each to better visualise this.
+
+```{r}
+ggplot(daily_wday_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Weekday, y = Steps), fill = "aquamarine4") +
+    geom_hline(aes(yintercept = 5000, col = "Low")) +
+    geom_hline(aes(yintercept = 10000, col = "Ideal")) +
+    labs(title = "Step Habits per Day of Week", col = "Steps")
+```
+
+Overall, average step count seems to be about the same over each day of the week with Sunday only slightly lower than other days. The step averages were around 7.5k which is right in the middle of the low count and the ideal count.
+
+```{r}
+ggplot(daily_wday_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Weekday, y = Weight), fill = "aquamarine4") +
+    geom_rect(aes(xmin = 0, xmax = 8, ymin = 94, ymax = 153,
+                  col = "Women"), fill = "lightblue", alpha = 0.03) +
+    geom_rect(aes(xmin = 0, xmax = 8, ymin = 107, ymax = 177,
+                  col = "Men"), fill = "pink", alpha = 0.03) +
+    labs(title = "Weight Tracking per Day of Week", col = "Ideal Weight")
+```
+
+Looking at the graph, the weight averages over every day fall within the range for the ideal weight for men. This hints that the majority of the users may be men, but considering the BMI averages from before, it is more likely due to the average user being overweight. Overall, the weight doesn’t change much over the course of the week. As mentioned before, Wednesday being higher is likely due to the obese person weighing in on that day.
+
+```{r}
+ggplot(sleep_wday_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Weekday, y = Hours, fill = ActivityType),
+             position = position_stack(reverse = TRUE)) +
+    geom_rect(aes(xmin = 0, xmax = 8, ymin = 7, ymax = 9,
+                  col = "Recommended"), fill = "pink", alpha = 0.02) +
+    labs(title = "Sleep Habits per Day of Week", col = "Sleep")
+```
+
+The weekday sleep data looks much better than the user data. The graph shows that users are getting the recommended sleep on most days. They seem to get about the same amount of sleep on most days with Sunday being a day they get slightly more. Due to errors giving many low sleep counts, it’s likely that the users fall within the recommended sleep range everyday.
+
+```{r}
+ggplot(intensity_wday_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Weekday, y = Distance, fill = ActivityType)) +
+    labs(title = "Intensity Distance per Day of Week")
+```
+
+According to the graph, user activity level doesn’t vary much from day to day. Like with the user data, the weekday data shows that a large portion of the distance (nearly half) is made up of more intense activity. Sunday shows slightly lower activity which matches the step count.
+
+```{r}
+ggplot(intensity_wday_means) +
+    geom_bar(stat = "identity", 
+             aes(x = Weekday, y = Hours, fill = ActivityType)) +
+    labs(title = "Intensity Time per Day of Week")
+```
+
+This graph makes even more clear than the user data that the users spend most of their time being sedentary at over 15 hours a day. Users then spend around 2-3 hours being likely active and less than an hour being more intensely active.
+
+
+
+# Discussion
+
+The data showed that all of the users tracked their steps, that most tracked their steps everyday, and that step count didn’t vary much from day to day. However, most users were not meeting the recommended step count of 10k steps a day. Half of the users also tracked their heart rate and a fourth of the users tracked also their weight, but with only 2 users tracking on a regular basis. According to their BMI, all but one of those users is either a healthy weight or overweight. A few users also quit tracking everything during the month, so it seems that those that quit tracking quit tracking everything.
+
+Three quarters of users tracked their sleep. There seemed to be high errors in the data that gave very low hours of sleeping time. However, when looking at the weekly data, the sleep time mostly fell within the recommended range. So, it seems that the average tracker gets the recommended amount of sleep every night. Despite most having a step count below recommended levels, the intensity data seems show that many users participate in regular exercise. This says that FitBit users are primarily workers that do office work rather than jobs such as customer service or labor where you would be on your feet most of the day.
+
+Based on this information, it seems that most users were tracking their health habits to either maintain or somewhat improve their health. The users were also likely office workers who spent most of the day sitting and therefore needing extra help to make sure they were getting enough exercise such as using a FitBit. Therefore, this should be the target demographic for marketing health tracking products such as those that Bellabeat sells.
+
+When exploring the data, the possibility for errors was found. This data also has a small sample, both in user count and in time, which would explain why some of the data was skewed. If further research is desired, better prepared data with a larger sample size is needed to help prevent these issues. If Bellabeat wants to do further research, could do a promotion by offering a free month of their subscription for customers that provide their data for analysis and analyze their last year of data.
+
